@@ -33,6 +33,8 @@ namespace OpenKh.Patcher
     {
         internal record HedEntry(string FileName, Hed.Entry Entry, string PkgFilePath);
 
+        internal record FoundHedAsset(HedEntry Entry, string RemasteredSubAssetName);
+
         private static readonly string[] Kh2Pkgs = new string[]
         {
             "kh2_first",
@@ -86,15 +88,66 @@ namespace OpenKh.Patcher
             return path.Replace("\\", "/");
         }
 
-        public bool Exists(string path) => _entries.ContainsKey(NormalizePath(path));
+        private FoundHedAsset FindHedAsset(string path)
+        {
+            path = NormalizePath(path);
+            if (_entries.ContainsKey(path))
+                return new FoundHedAsset(_entries[path], null);
+
+            // remastered/ isn't actually a path in the game packages
+            if (!path.StartsWith("remastered/"))
+                return null;
+            path = path.Substring("remastered/".Length);
+            if (_entries.ContainsKey(path))
+                return new FoundHedAsset(_entries[path], null);
+
+            // If it's something like remastered/menu/us/title.2ld/US_title_2ld0.png, there should be an entry for
+            // menu/us/title.2ld with individual HD sub-assets
+            var parentPath = NormalizePath(Path.GetDirectoryName(path));
+            if (!_entries.ContainsKey(parentPath))
+                return null;
+
+            var fileName = Path.GetFileName(path);
+            var entry = _entries[parentPath];
+            var pkgStream = _pkgStreams[entry.PkgFilePath];
+            lock (pkgStream)
+            {
+                var hdAsset = new EgsHdAsset(pkgStream.SetPosition(entry.Entry.Offset));
+                if (hdAsset.Assets.Contains(fileName))
+                    return new FoundHedAsset(entry, fileName);
+            }
+
+            return null;
+        }
+
+        public bool Exists(string path)
+        {
+            return FindHedAsset(path) != null;
+        }
+
         public Stream OpenRead(string path)
         {
-            var entry = _entries[NormalizePath(path)];
-            lock (_pkgStreams[entry.PkgFilePath])
+            var hedAsset = FindHedAsset(path);
+            if (hedAsset == null)
+                throw new FileNotFoundException("Couldn't find an entry for path " + path);
+
+            var entry = hedAsset.Entry;
+            var pkgStream = _pkgStreams[entry.PkgFilePath];
+            lock (pkgStream)
             {
-                var hdAsset = new EgsHdAsset(_pkgStreams[entry.PkgFilePath].SetPosition(entry.Entry.Offset));
-                return new MemoryStream(hdAsset.OriginalData);
+                var remasteredSubAssetName = hedAsset.RemasteredSubAssetName;
+                var hdAsset = new EgsHdAsset(pkgStream.SetPosition(entry.Entry.Offset));
+                if (remasteredSubAssetName == null)
+                    return new MemoryStream(hdAsset.OriginalData);
+                else
+                {
+                    var decompressedData = hdAsset.RemasteredAssetsDecompressedData;
+                    if (decompressedData.ContainsKey(remasteredSubAssetName))
+                        return new MemoryStream(decompressedData[remasteredSubAssetName]);
+                }
             }
+
+            throw new FileNotFoundException("Couldn't find an entry for path " + path);
         }
         public void Dispose()
         {
